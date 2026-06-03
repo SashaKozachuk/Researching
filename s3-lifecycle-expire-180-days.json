@@ -1,0 +1,17 @@
+{
+  "Rules": [
+    {
+      "ID": "delete-objects-older-than-180-days",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": ""
+      },
+      "Expiration": {
+        "Days": 180
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 180
+      }
+    }
+  ]
+}
