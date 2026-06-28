@@ -40,6 +40,12 @@ class ComfyInstance:
 
 
 @dataclass(frozen=True)
+class ExistingProcess:
+    pid: int
+    command: str
+
+
+@dataclass(frozen=True)
 class SupervisorConfig:
     comfy_instances: tuple[ComfyInstance, ...]
     comfy_dir: Path
@@ -115,6 +121,92 @@ def unregister_process(process: subprocess.Popen[bytes]) -> None:
     with PROCESS_LOCK:
         if process in MANAGED_PROCESSES:
             MANAGED_PROCESSES.remove(process)
+
+
+def process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_process_args(pid: int) -> list[str]:
+    try:
+        raw_cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (FileNotFoundError, PermissionError, OSError):
+        return []
+
+    return [
+        part.decode("utf-8", errors="replace")
+        for part in raw_cmdline.split(b"\0")
+        if part
+    ]
+
+
+def process_cwd(pid: int) -> Path | None:
+    try:
+        return Path(f"/proc/{pid}/cwd").resolve()
+    except (FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def is_image_server_process(
+    pid: int,
+    args: list[str],
+    workspace_dir: Path,
+) -> bool:
+    if pid == os.getpid() or not args:
+        return False
+
+    script_args = [
+        Path(arg)
+        for arg in args
+        if Path(arg).name == "image_generation_server.py"
+    ]
+    if not script_args:
+        return False
+
+    expected_script = workspace_dir / "image_generation_server.py"
+    for script_arg in script_args:
+        if script_arg.is_absolute() and script_arg == expected_script:
+            return True
+
+    cwd = process_cwd(pid)
+    if cwd is not None:
+        for script_arg in script_args:
+            if (cwd / script_arg).resolve() == expected_script:
+                return True
+
+    return any(script_arg.name == "image_generation_server.py" for script_arg in script_args)
+
+
+def find_existing_image_server(config: SupervisorConfig) -> ExistingProcess | None:
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return None
+
+    matches: list[ExistingProcess] = []
+    workspace_dir = config.workspace_dir.resolve()
+
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+
+        pid = int(entry.name)
+        args = read_process_args(pid)
+        if not is_image_server_process(pid, args, workspace_dir):
+            continue
+
+        command = " ".join(shlex.quote(arg) for arg in args)
+        matches.append(ExistingProcess(pid=pid, command=command))
+
+    if not matches:
+        return None
+
+    return min(matches, key=lambda process: process.pid)
 
 
 def stop_process(
@@ -212,10 +304,42 @@ def supervise_image_server(config: SupervisorConfig) -> None:
     server_log = config.log_dir / "image_generation_server.log"
     supervisor_log = config.log_dir / "image_generation_server_supervisor.log"
 
-    process, log_handle = start_image_server(config, server_log, supervisor_log)
+    existing_process = find_existing_image_server(config)
+    process: subprocess.Popen[bytes] | None = None
+    log_handle: object | None = None
+    existing_pid: int | None = None
+
+    if existing_process is not None:
+        existing_pid = existing_process.pid
+        log(
+            f"Image generation server is already running as PID {existing_pid}: "
+            f"{existing_process.command}. Monitoring existing process; "
+            "a managed replacement will start if it exits.",
+            supervisor_log,
+        )
+    else:
+        process, log_handle = start_image_server(config, server_log, supervisor_log)
 
     while not STOP_EVENT.is_set():
         time.sleep(config.health_interval)
+
+        if process is None:
+            if existing_pid is not None and process_exists(existing_pid):
+                continue
+
+            if existing_pid is not None:
+                log(
+                    f"Existing image generation server PID {existing_pid} is no longer running.",
+                    supervisor_log,
+                )
+                existing_pid = None
+
+            if STOP_EVENT.is_set():
+                break
+
+            time.sleep(config.restart_delay)
+            process, log_handle = start_image_server(config, server_log, supervisor_log)
+            continue
 
         return_code = process.poll()
         if return_code is None:
@@ -234,9 +358,11 @@ def supervise_image_server(config: SupervisorConfig) -> None:
         time.sleep(config.restart_delay)
         process, log_handle = start_image_server(config, server_log, supervisor_log)
 
-    stop_process(process, supervisor_log, "image generation server")
-    log_handle.close()
-    unregister_process(process)
+    if process is not None:
+        stop_process(process, supervisor_log, "image generation server")
+        if log_handle is not None:
+            log_handle.close()
+        unregister_process(process)
 
 
 def supervise_comfy_instance(config: SupervisorConfig, instance: ComfyInstance) -> None:
